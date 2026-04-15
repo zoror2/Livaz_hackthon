@@ -11,7 +11,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from backend.sentinel_hub import fetch_ndwi_overlay, BBOXES
 from backend.run_inference import load_test_ids, find_nearest_tile, run_prithvi_inference
-from backend.twilio_alerts import trigger_emergency_call
+from backend.twilio_alerts import trigger_emergency_call, send_shelter_sms
+from backend.shelter_finder import find_nearby_shelters, format_shelter_sms
 
 
 app = FastAPI(title="Advaya Risk Engine API")
@@ -328,11 +329,13 @@ async def predict_live(req: PredictRequest):
         )
         weather_future  = fetch_live_weather(req.lat, req.lon)
         elev_future     = get_elevation(req.lat, req.lon)
+        shelter_future  = find_nearby_shelters(req.lat, req.lon, radius_m=5000, limit=3)
 
-        result, weather, elevation = await asyncio.gather(
-            inference_future, weather_future, elev_future,
+        result, weather, elevation, nearby_shelters = await asyncio.gather(
+            inference_future, weather_future, elev_future, shelter_future,
         )
     except Exception as e:
+        nearby_shelters = []
         return {"status": "error", "message": str(e)}
 
     # --- Elevation risk: 0-25 pts ---
@@ -356,8 +359,10 @@ async def predict_live(req: PredictRequest):
     score = elev_score + coast_score + satellite_score + weather_score
     risk  = compute_risk_from_score(score)
 
-    # Auto-trigger emergency phone call if CRITICAL
+    # Auto-trigger emergency phone call + shelter WhatsApp if CRITICAL
     call_status = None
+    sms_status  = None
+    shelters    = nearby_shelters or []
     if score >= 75:
         call_status = trigger_emergency_call(
             lat=req.lat, lon=req.lon, score=score,
@@ -366,6 +371,10 @@ async def predict_live(req: PredictRequest):
             flood_pct=result["flood_pct"],
             forecast_48h=forecast_12h,
         )
+        # Send SMS with nearest shelter locations
+        if shelters:
+            sms_body   = format_shelter_sms(score, shelters, forecast_12h)
+            sms_status = send_shelter_sms(sms_body)
 
     return {
         "status":          "success",
@@ -375,6 +384,8 @@ async def predict_live(req: PredictRequest):
         "alerts":          risk["alerts"],
         "prediction":      result,
         "call_alert":      call_status,
+        "sms_alert":       sms_status,
+        "shelters":        shelters,
         "breakdown": {
             "elevation_m":     round(elevation, 1) if elevation is not None else None,
             "coast_km":        round(coast_km, 1),

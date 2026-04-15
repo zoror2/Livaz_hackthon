@@ -58,3 +58,21 @@ def trigger_emergency_call(
     except Exception as e:
         print(f"[TWILIO] Call failed: {e}")
         return {"status": "call_failed", "error": str(e)}
+
+
+def send_shelter_sms(sms_body: str):
+    """
+    Sends shelter info via WhatsApp (Twilio Sandbox).
+    Works on trial accounts for international delivery.
+    """
+    try:
+        msg = client.messages.create(
+            body=sms_body,
+            to=f"whatsapp:{ALERT_TO}",
+            from_="whatsapp:+14155238886",  # Twilio WhatsApp Sandbox
+        )
+        print(f"[TWILIO] WhatsApp alert sent: SID={msg.sid}")
+        return {"status": "whatsapp_sent", "msg_sid": msg.sid}
+    except Exception as e:
+        print(f"[TWILIO] WhatsApp failed: {e}")
+        return {"status": "whatsapp_failed", "error": str(e)}
