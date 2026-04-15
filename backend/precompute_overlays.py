@@ -58,8 +58,8 @@ def pred_tiff_to_png(tiff_path: Path, out_png: Path) -> dict | None:
         H, W = data.shape
         rgba = np.zeros((H, W, 4), dtype=np.uint8)
 
-        # colour flooded pixels
-        flood_mask = (data == 1)
+        # Flood pixels are encoded as 255 by inference.py (not 1)
+        flood_mask = (data == 255)
         rgba[flood_mask] = FLOOD_RGBA
 
         # Save

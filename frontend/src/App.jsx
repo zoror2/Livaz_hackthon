@@ -35,22 +35,23 @@ export default function App() {
     return map[level] || '#94a3b8';
   };
 
+  const [tileData, setTileData] = useState(null);
+
   const handlePrediction = (data) => {
     if (data.status !== 'success') return;
     setWeatherData({
-      rainfall:  data.weather.rainfall,
-      windSpeed: data.weather.windSpeed,
-      humidity:  data.weather.humidity,
+      rainfall:    data.weather.rainfall,
+      windSpeed:   data.weather.windSpeed,
+      humidity:    data.weather.humidity,
+      forecast12h: data.weather.forecast_12h ?? 0,
     });
     setRiskData({
       score:  data.composite_score,
       level:  data.risk_level,
       alerts: data.alerts,
     });
-    // Capture live model metrics if available
-    if (data.prediction) {
-      setModelMetrics(data.prediction);
-    }
+    if (data.nearest_overlay) setTileData(data.nearest_overlay);
+    if (data.prediction)      setTileData(data.prediction);
   };
 
   const riskColor = getRiskColor(riskData.level);
@@ -133,9 +134,10 @@ export default function App() {
           {/* Weather Cards */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
             {[
-              { icon: <CloudRain size={20} color="#2563eb" />, label: 'Rainfall',   val: weatherData.rainfall },
-              { icon: <Wind      size={20} color="#64748b" />, label: 'Wind Speed', val: weatherData.windSpeed },
-              { icon: <Droplets  size={20} color="#0284c7" />, label: 'Humidity',   val: weatherData.humidity },
+              { icon: <CloudRain size={20} color="#2563eb" />, label: 'Rainfall',     val: weatherData.rainfall },
+              { icon: <Wind      size={20} color="#64748b" />, label: 'Wind Speed',   val: weatherData.windSpeed },
+              { icon: <Droplets  size={20} color="#0284c7" />, label: 'Humidity',     val: weatherData.humidity },
+              { icon: <CloudRain size={20} color="#f97316" />, label: '12h Forecast', val: `${weatherData.forecast12h} mm` },
             ].map(({ icon, label, val }) => (
               <div
                 key={label}
@@ -181,14 +183,22 @@ export default function App() {
             Model Performance
           </h3>
 
-          {[
-            { label: 'Dataset',    val: 'Sen1Floods11' },
+          {(tileData ? [
+            { label: 'Dataset',     val: 'Sen1Floods11' },
+            { label: 'Tile ID',     val: tileData.image_id || '—' },
+            { label: 'Flood Detected', val: `${tileData.flood_pct ?? '—'}%` },
+            { label: 'Accuracy',    val: tileData.accuracy != null ? (tileData.accuracy*100).toFixed(1)+'%' : '—' },
+            { label: 'F1 Score',    val: tileData.f1  != null ? tileData.f1.toFixed(3)  : '—' },
+            { label: 'IoU',         val: tileData.iou != null ? tileData.iou.toFixed(3) : '—' },
+            { label: 'Model',       val: 'Prithvi-EO-2.0-300M' },
+          ] : [
+            { label: 'Dataset',     val: 'Sen1Floods11' },
             { label: 'Test Images', val: '67 tiles' },
-            { label: 'Accuracy',   val: '92.94 %' },
-            { label: 'Avg F1',     val: '0.461' },
-            { label: 'Avg IoU',    val: '0.368' },
-            { label: 'Model',      val: 'Prithvi-EO-2.0-300M' },
-          ].map(({ label, val }) => (
+            { label: 'Accuracy',    val: '92.94 %' },
+            { label: 'Avg F1',      val: '0.461' },
+            { label: 'Avg IoU',     val: '0.368' },
+            { label: 'Model',       val: 'Prithvi-EO-2.0-300M' },
+          ]).map(({ label, val }) => (
             <div
               key={label}
               style={{

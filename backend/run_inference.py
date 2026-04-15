@@ -23,12 +23,27 @@ CHECKPOINT = WORKSPACE / "test" / "prithvi_sen1floods11" / "Prithvi-EO-V2-300M-T
 CONFIG     = WORKSPACE / "test" / "prithvi_sen1floods11" / "config_local.yaml"
 DATA_DIR   = WORKSPACE / "dataset" / "dataset" / "Sen1Floods11_8Channel" / "image"
 LABEL_DIR  = WORKSPACE / "dataset" / "dataset" / "Sen1Floods11_8Channel" / "label"
+TEMP_DIR   = WORKSPACE / "backend" / "static" / "live" / "temp_6band"
 LIVE_OUT   = WORKSPACE / "backend" / "static" / "live"
 LIVE_OUT.mkdir(parents=True, exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # All 67 test image IDs with their geographic centres (from manifest)
 import sys
 sys.path.insert(0, str(WORKSPACE))
+
+
+def convert_8ch_to_6band(src: Path, dst: Path) -> None:
+    """Convert 8-channel Sen1Floods11 image to 6-channel expected by Prithvi."""
+    with rasterio.open(src) as f:
+        data = f.read()
+        meta = f.meta.copy()
+    # Duplicate band 4 for NIR/SWIR slots — same trick as run_full_evaluation.py
+    new_data = data[[0, 1, 2, 3, 3, 3]]
+    meta.update(count=6)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(dst, "w", **meta) as f:
+        f.write(new_data)
 
 
 def load_test_ids() -> list[str]:
@@ -135,42 +150,62 @@ def compute_metrics(pred_tif: Path, image_id: str) -> dict:
 
 def run_prithvi_inference(image_id: str, tile_info: dict) -> dict:
     """
-    Run the full Prithvi model and return prediction results.
-    Returns a dict with all metrics, PNG URL, and bounds.
+    1. Convert 8-channel image -> 6-channel (Prithvi format)
+    2. Run Prithvi-EO-2.0 inference FRESH every time (no cache)
+    3. Convert prediction tiff -> transparent blue PNG
+    4. Return real metrics
     """
-    input_tif = DATA_DIR / f"{image_id}_image.tif"
-    pred_tif  = LIVE_OUT / f"pred_{image_id}.tiff"
-    out_png   = LIVE_OUT / f"{image_id}.png"
+    input_tif   = DATA_DIR / f"{image_id}_image.tif"
+    temp_6band  = TEMP_DIR / f"{image_id}_6band.tif"
+    pred_tif    = LIVE_OUT / f"pred_{image_id}.tiff"
+    out_png     = LIVE_OUT / f"{image_id}.png"
 
-    # Skip inference if already cached
+    if not input_tif.exists():
+        raise FileNotFoundError(f"Dataset image not found: {input_tif}")
+
+    # Always delete old prediction so we run fresh inference every time
+    if pred_tif.exists():
+        pred_tif.unlink()
+    if out_png.exists():
+        out_png.unlink()
+
+    # Step 1: Convert 8ch -> 6ch (can reuse if already done)
+    if not temp_6band.exists():
+        convert_8ch_to_6band(input_tif, temp_6band)
+
+    # Step 2: Run live Prithvi inference
+    cmd = [
+        str(PYTHON), str(INFER_SCR),
+        "--data_file",     str(temp_6band),
+        "--config",        str(CONFIG),
+        "--checkpoint",    str(CHECKPOINT),
+        "--output_dir",    str(LIVE_OUT),
+        "--input_indices", "0", "1", "2", "3", "4", "5",
+        "--rgb_outputs",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"Inference failed:\n{result.stderr[-600:]}")
+
+    # inference.py saves as pred_<stem>.tiff - rename to our expected path
+    stem  = temp_6band.stem   # e.g. "163406_6band"
+    saved = LIVE_OUT / f"pred_{stem}.tiff"
+    if saved.exists() and saved != pred_tif:
+        saved.rename(pred_tif)
+
     if not pred_tif.exists():
-        cmd = [
-            str(PYTHON), str(INFER_SCR),
-            "--data_file",  str(input_tif),
-            "--config",     str(CONFIG),
-            "--checkpoint", str(CHECKPOINT),
-            "--output_dir", str(LIVE_OUT),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            raise RuntimeError(f"Inference failed:\n{result.stderr[-500:]}")
+        raise FileNotFoundError(f"Prediction tiff missing after inference: {pred_tif}")
 
-        # inference.py saves to output_dir/pred_<stem>.tiff
-        stem = input_tif.stem  # e.g. "989230_image"
-        saved = LIVE_OUT / f"pred_{stem}.tiff"
-        if saved.exists() and saved != pred_tif:
-            saved.rename(pred_tif)
-
-    if not pred_tif.exists():
-        raise FileNotFoundError(f"Prediction tiff not found after inference: {pred_tif}")
-
+    # Step 3: Convert to PNG overlay
     flood_pct = pred_to_png(pred_tif, out_png)
-    metrics   = compute_metrics(pred_tif, image_id)
+
+    # Step 4: Compute real metrics
+    metrics = compute_metrics(pred_tif, image_id)
 
     return {
-        "image_id":   image_id,
-        "bounds":     tile_info["bounds"],
-        "png_url":    f"/static/live/{image_id}.png",
-        "flood_pct":  round(flood_pct, 2),
+        "image_id":  image_id,
+        "bounds":    tile_info["bounds"],
+        "png_url":   f"/static/live/{image_id}.png",
+        "flood_pct": round(flood_pct, 2),
         **metrics,
     }

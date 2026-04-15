@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import asyncio
 from pathlib import Path
 import httpx
@@ -10,6 +11,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from backend.sentinel_hub import fetch_ndwi_overlay, BBOXES
 from backend.run_inference import load_test_ids, find_nearest_tile, run_prithvi_inference
+from backend.twilio_alerts import trigger_emergency_call
 
 
 app = FastAPI(title="Advaya Risk Engine API")
@@ -38,38 +40,124 @@ class PredictRequest(BaseModel):
 
 
 async def fetch_live_weather(lat: float, lon: float):
+    """
+    Fetches CURRENT weather + NEXT 12-HOUR rainfall forecast.
+    The forecast rainfall is used for PREDICTIVE early warning —
+    we warn people NOW before the flood hits.
+    """
     url = (
         f"https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
         f"&current=temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m"
+        f"&hourly=precipitation"
+        f"&forecast_hours=12"
     )
     async with httpx.AsyncClient() as client:
         try:
             r = await client.get(url, timeout=5)
             if r.status_code == 200:
-                cur = r.json().get("current", {})
+                data = r.json()
+                cur  = data.get("current", {})
+
+                # Sum rainfall predicted over next 12 hours
+                hourly_precip = data.get("hourly", {}).get("precipitation", [])
+                forecast_12h  = sum(hourly_precip[:12])
+                peak_hourly   = max(hourly_precip[:12]) if hourly_precip else 0
+
                 return {
-                    "temp":         f"{cur.get('temperature_2m', 0)}°C",
-                    "humidity":     f"{cur.get('relative_humidity_2m', 0)}%",
-                    "rainfall":     f"{cur.get('precipitation', 0)} mm",
-                    "windSpeed":    f"{cur.get('wind_speed_10m', 0)} km/h",
-                    "raw_rainfall": float(cur.get("precipitation", 0)),
+                    "temp":           f"{cur.get('temperature_2m', 0)}°C",
+                    "humidity":       f"{cur.get('relative_humidity_2m', 0)}%",
+                    "rainfall":       f"{cur.get('precipitation', 0)} mm",
+                    "windSpeed":      f"{cur.get('wind_speed_10m', 0)} km/h",
+                    "raw_rainfall":   float(cur.get("precipitation", 0)),
+                    "forecast_12h":   round(forecast_12h, 1),
+                    "peak_hourly":    round(peak_hourly, 1),
                 }
         except Exception as e:
             print(f"Weather API error: {e}")
     return {"temp": "28°C", "humidity": "85%", "rainfall": "0 mm",
-            "windSpeed": "18 km/h", "raw_rainfall": 0.0}
+            "windSpeed": "18 km/h", "raw_rainfall": 0.0,
+            "forecast_12h": 0.0, "peak_hourly": 0.0}
+
+# Indian east + west coast approximate points for proximity calculation
+_INDIA_COAST = [
+    (8.1,77.5),(9.0,78.1),(10.0,79.5),(11.0,79.8),(11.5,79.9),
+    (12.0,80.2),(13.1,80.3),(14.0,80.0),(15.0,80.3),(16.0,81.2),
+    (17.0,82.3),(18.0,83.5),(19.0,84.7),(20.0,86.4),(21.5,87.5),
+    # West coast
+    (8.5,76.9),(10.0,76.2),(11.0,75.4),(12.0,74.8),(13.0,74.8),
+    (14.0,74.5),(15.0,73.9),(16.0,73.5),(18.0,72.8),(19.0,72.8),
+]
 
 
-def compute_risk(raw_rainfall: float, avg_flood_pct: float) -> dict:
+async def get_elevation(lat: float, lon: float) -> float | None:
+    """Free Open-Elevation API — gives exact elevation for any point."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(
+                f"https://api.open-elevation.com/api/v1/lookup?locations={lat},{lon}"
+            )
+            if r.status_code == 200:
+                results = r.json().get("results", [])
+                if results:
+                    return float(results[0]["elevation"])
+    except Exception:
+        pass
+    return None
+
+
+def _coast_dist_deg(lat: float, lon: float) -> float:
+    return min(math.sqrt((lat-c[0])**2+(lon-c[1])**2) for c in _INDIA_COAST)
+
+
+
+def compute_risk_from_score(score: int) -> dict:
+    """Convert a pre-computed score into level + bilingual alerts."""
+    score = max(0, min(100, score))
+    if score >= 75:
+        level = "CRITICAL"
+        alerts = {
+            "en": "CRITICAL: Immediate evacuation required in low-lying coastal areas.",
+            "ta": "முக்கியமான: தாழ்வான கடலோர பகுதிகளில் உடனடியாக வெளியேற்றம் தேவை.",
+            "te": "క్రిటికల్: తక్కువ ఎత్తైన తీర ప్రాంతాల్లో వెంటనే తరలింపు అవసరం.",
+        }
+    elif score >= 50:
+        level = "HIGH"
+        alerts = {
+            "en": "HIGH RISK: Severe flooding expected. Move to higher ground immediately.",
+            "ta": "அதிக ஆபத்து: கடுமையான வெள்ளம் எதிர்பார்க்கப்படுகிறது. உயரமான இடத்திற்கு செல்லுங்கள்.",
+            "te": "అధిక ప్రమాదం: తీవ్రమైన వరద నీరు వస్తుందని అంచనా. ఎత్తైన ప్రదేశానికి వెళ్ళండి.",
+        }
+    elif score >= 25:
+        level = "MODERATE"
+        alerts = {
+            "en": "MODERATE: Flood watch in effect. Stay vigilant and monitor updates.",
+            "ta": "மிதமான: வெள்ள கண்காணிப்பு அமலில் உள்ளது. விழிப்புடன் இருங்கள்.",
+            "te": "మధ్యస్థంగా: వరద హెచ్చరిక అమలులో ఉంది. జాగ్రత్తగా ఉండండి.",
+        }
+    else:
+        level = "LOW"
+        alerts = {
+            "en": "LOW RISK: No immediate threat detected. Normal conditions.",
+            "ta": "குறைந்த ஆபத்து: உடனடி அச்சுறுத்தல் இல்லை. சாதாரண நிலைமைகள்.",
+            "te": "తక్కువ ప్రమాదం: తక్షణ ముప్పు లేదు. సాధారణ పరిస్థితులు.",
+        }
+    return {"level": level, "alerts": alerts}
+
+
+def compute_risk(raw_rainfall: float, flood_pct: float) -> dict:
     """
-    Simple weighted fusion:
-      - Weather contributes up to 50 points (20mm = max)
-      - Satellite flood % contributes up to 50 points
+    Satellite flood detection is the PRIMARY risk signal (up to 60 pts).
+    Live weather amplifies it — heavy rain adds up to 40 pts on top.
+
+    flood_pct = 0%  + 0mm rain  → score ~0   (truly safe tile, no rain)
+    flood_pct = 7%  + 0mm rain  → score ~42  (MODERATE baseline from model)
+    flood_pct = 7%  + 20mm rain → score ~82  (HIGH — rain on flood-prone area)
+    flood_pct = 30% + 20mm rain → score ~100 (CRITICAL)
     """
-    weather_score   = min(50, int(raw_rainfall * 2.5))
-    satellite_score = min(50, int(avg_flood_pct * 5))
-    score = weather_score + satellite_score
+    satellite_score = min(60, int(flood_pct * 6))            # Prithvi model baseline
+    weather_bonus   = min(40, int(raw_rainfall * 2.0))        # Live weather amplifier
+    score = satellite_score + weather_bonus
 
     if score >= 75:
         level = "CRITICAL"
@@ -88,14 +176,14 @@ def compute_risk(raw_rainfall: float, avg_flood_pct: float) -> dict:
     elif score >= 25:
         level = "MODERATE"
         alerts = {
-            "en": "MODERATE: Flood watch in effect. Stay vigilant.",
+            "en": "MODERATE: Flood watch in effect. Stay vigilant and monitor updates.",
             "ta": "மிதமான: வெள்ள கண்காணிப்பு அமலில் உள்ளது. விழிப்புடன் இருங்கள்.",
             "te": "మధ్యస్థంగా: వరద హెచ్చరిక అమలులో ఉంది. జాగ్రత్తగా ఉండండి.",
         }
     else:
         level = "LOW"
         alerts = {
-            "en": "LOW RISK: No immediate threat. Normal conditions.",
+            "en": "LOW RISK: No immediate threat detected. Normal conditions.",
             "ta": "குறைந்த ஆபத்து: உடனடி அச்சுறுத்தல் இல்லை. சாதாரண நிலைமைகள்.",
             "te": "తక్కువ ప్రమాదం: తక్షణ ముప్పు లేదు. సాధారణ పరిస్థితులు.",
         }
@@ -160,68 +248,139 @@ def get_overlays():
 @app.post("/api/predict")
 async def predict(req: PredictRequest):
     """
-    1. Fetch real-time weather for clicked coordinates.
-    2. Use the nearest pre-computed satellite overlay to get flood %.
-    3. Fuse both into a composite risk score.
+    Location-specific risk for every point:
+    - Elevation from Open-Elevation API (lower = more flood-prone)
+    - Coastal proximity (closer to Indian coast = higher risk)
+    - Nearest Prithvi model tile flood detection
+    - Live weather from Open-Meteo
     """
-    weather = await fetch_live_weather(req.lat, req.lon)
+    # Run weather + elevation in parallel
+    weather, elevation = await asyncio.gather(
+        fetch_live_weather(req.lat, req.lon),
+        get_elevation(req.lat, req.lon),
+    )
 
-    # Find nearest overlay to the clicked point using simple Euclidean distance
+    # --- Elevation risk: 0-30 pts (sea level = 30, 300m+ = 0) ---
+    if elevation is not None:
+        elev_score = max(0, int(30 * (1 - min(elevation, 300) / 300)))
+    else:
+        elev_score = 10  # unknown → moderate
+
+    # --- Coastal proximity: 0-20 pts (within 10km = 20, 200km+ = 0) ---
+    coast_deg   = _coast_dist_deg(req.lat, req.lon)
+    coast_km    = coast_deg * 111
+    coast_score = max(0, int(20 * (1 - min(coast_km, 200) / 200)))
+
+    # --- Nearest Prithvi tile: 0-30 pts ---
     nearest = None
     min_dist = float("inf")
     if MANIFEST_PATH.exists():
         with open(MANIFEST_PATH) as f:
             overlays = json.load(f)
         for o in overlays:
-            # bounds = [[south, west], [north, east]]
-            center_lat = (o["bounds"][0][0] + o["bounds"][1][0]) / 2
-            center_lon = (o["bounds"][0][1] + o["bounds"][1][1]) / 2
-            dist = ((center_lat - req.lat) ** 2 + (center_lon - req.lon) ** 2) ** 0.5
+            clat = (o["bounds"][0][0] + o["bounds"][1][0]) / 2
+            clon = (o["bounds"][0][1] + o["bounds"][1][1]) / 2
+            dist = math.sqrt((clat - req.lat)**2 + (clon - req.lon)**2)
             if dist < min_dist:
                 min_dist = dist
                 nearest = o
+    satellite_score = min(30, int((nearest["flood_pct"] if nearest else 0) * 3))
 
-    avg_flood_pct = nearest["flood_pct"] if nearest else 0.0
-    risk = compute_risk(weather["raw_rainfall"], avg_flood_pct)
+    # --- Weather bonus: 0-20 pts ---
+    weather_score = min(20, int(weather["raw_rainfall"] * 2.0))
+
+    score = elev_score + coast_score + satellite_score + weather_score
+    risk  = compute_risk_from_score(score)
 
     return {
         "status":          "success",
-        "composite_score": risk["score"],
+        "composite_score": score,
         "risk_level":      risk["level"],
         "weather":         weather,
         "alerts":          risk["alerts"],
         "nearest_overlay": nearest,
+        "breakdown": {
+            "elevation_m":    round(elevation, 1) if elevation is not None else None,
+            "coast_km":       round(coast_km, 1),
+            "elev_score":     elev_score,
+            "coast_score":    coast_score,
+            "satellite_score": satellite_score,
+            "weather_score":  weather_score,
+        },
     }
 
 
 @app.post("/api/predict_live")
 async def predict_live(req: PredictRequest):
     """
-    Runs actual Prithvi-EO-2.0 model on the nearest Sen1Floods11 test tile.
-    Takes ~28s on CPU. Returns real flood prediction PNG + F1/IoU metrics.
+    Runs actual Prithvi-EO-2.0 model LIVE on the nearest tile (~28s).
+    Also fetches elevation + weather for location-specific scoring.
     """
     test_ids  = load_test_ids()
     tile_info = find_nearest_tile(req.lat, req.lon, test_ids)
     if tile_info is None:
         return {"status": "error", "message": "No test tiles found."}
 
+    # Run model + elevation + weather in parallel
     try:
-        result = await asyncio.to_thread(
-            run_prithvi_inference,
-            tile_info["image_id"],
-            tile_info,
+        inference_future = asyncio.to_thread(
+            run_prithvi_inference, tile_info["image_id"], tile_info,
+        )
+        weather_future  = fetch_live_weather(req.lat, req.lon)
+        elev_future     = get_elevation(req.lat, req.lon)
+
+        result, weather, elevation = await asyncio.gather(
+            inference_future, weather_future, elev_future,
         )
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-    weather = await fetch_live_weather(req.lat, req.lon)
-    risk    = compute_risk(weather["raw_rainfall"], result["flood_pct"])
+    # --- Elevation risk: 0-25 pts ---
+    if elevation is not None:
+        elev_score = max(0, int(25 * (1 - min(elevation, 300) / 300)))
+    else:
+        elev_score = 8
+
+    # --- Coastal proximity: 0-15 pts ---
+    coast_deg   = _coast_dist_deg(req.lat, req.lon)
+    coast_km    = coast_deg * 111
+    coast_score = max(0, int(15 * (1 - min(coast_km, 200) / 200)))
+
+    # --- Prithvi model: 0-40 pts (PRIMARY) ---
+    satellite_score = min(40, int(result["flood_pct"] * 4))
+
+    # --- Predictive Weather: 0-20 pts (uses 12-hour FORECAST) ---
+    forecast_12h = weather.get("forecast_12h", 0.0)
+    weather_score = min(20, int(forecast_12h * 0.5))  # 40mm in 12h = 20 pts
+
+    score = elev_score + coast_score + satellite_score + weather_score
+    risk  = compute_risk_from_score(score)
+
+    # Auto-trigger emergency phone call if CRITICAL
+    call_status = None
+    if score >= 75:
+        call_status = trigger_emergency_call(
+            lat=req.lat, lon=req.lon, score=score,
+            risk_level=risk["level"],
+            rainfall=weather["rainfall"],
+            flood_pct=result["flood_pct"],
+            forecast_48h=forecast_12h,
+        )
 
     return {
         "status":          "success",
-        "composite_score": risk["score"],
+        "composite_score": score,
         "risk_level":      risk["level"],
         "weather":         weather,
         "alerts":          risk["alerts"],
         "prediction":      result,
+        "call_alert":      call_status,
+        "breakdown": {
+            "elevation_m":     round(elevation, 1) if elevation is not None else None,
+            "coast_km":        round(coast_km, 1),
+            "elev_score":      elev_score,
+            "coast_score":     coast_score,
+            "satellite_score": satellite_score,
+            "weather_score":   weather_score,
+        },
     }

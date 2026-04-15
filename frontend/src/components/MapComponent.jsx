@@ -72,12 +72,10 @@ export default function MapComponent({ onPrediction }) {
     setClickedPin(latlng);
     setIsLoading(true);
     setElapsed(0);
-
-    // Start elapsed timer
     timerRef.current = setInterval(() => setElapsed(e => e + 1), 1000);
 
     try {
-      // Call the LIVE inference endpoint — runs actual Prithvi model (~28s on CPU)
+      // Real-time Prithvi model inference (~28s on CPU)
       const res = await fetch(`${API}/api/predict_live`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -85,9 +83,8 @@ export default function MapComponent({ onPrediction }) {
       });
       const data = await res.json();
 
-      if (data.prediction) {
-        setHighlighted(data.prediction.image_id);
-      }
+      if (data.prediction) setHighlighted(data.prediction.image_id);
+      else if (data.nearest_overlay) setHighlighted(data.nearest_overlay.image_id);
       if (onPrediction) onPrediction(data);
     } catch (e) {
       console.error('Live inference error:', e);
