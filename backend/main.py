@@ -1,236 +1,227 @@
 import os
-import subprocess
-import sys
-import time
-import uuid
+import json
+import asyncio
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+import httpx
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from backend.sentinel_hub import fetch_ndwi_overlay, BBOXES
+from backend.run_inference import load_test_ids, find_nearest_tile, run_prithvi_inference
 
-import numpy as np
-import rasterio
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title="Coastal Climate Risk API", version="1.0.0")
+app = FastAPI(title="Advaya Risk Engine API")
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-PRITHVI_DIR = BASE_DIR / "test" / "prithvi_sen1floods11"
-INFERENCE_SCRIPT = PRITHVI_DIR / "inference.py"
-CONFIG_PATH = PRITHVI_DIR / "config_local.yaml"
-CHECKPOINT_PATH = PRITHVI_DIR / "Prithvi-EO-V2-300M-TL-Sen1Floods11.pt"
-DEFAULT_DATA_FILE = PRITHVI_DIR / "examples" / "India_900498_S2Hand.tif"
-OUTPUT_ROOT = BASE_DIR / "output" / "api_runs"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-RESULTS_DB: Dict[str, Dict[str, Any]] = {}
+WORKSPACE_DIR  = Path("D:/AdvayaHakcathon")
+STATIC_DIR     = WORKSPACE_DIR / "backend" / "static"
+MANIFEST_PATH  = STATIC_DIR / "overlays" / "manifest.json"
+SENTINEL_DIR   = STATIC_DIR / "sentinel"
+SENTINEL_DIR.mkdir(parents=True, exist_ok=True)
+
+# Serve PNGs at /static/...
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 class PredictRequest(BaseModel):
-    district_name: str = Field(..., min_length=2, max_length=100)
-    rainfall_30d: List[float]
-    windspeed_30d: List[float]
-    satellite_path: Optional[str] = Field(
-        default=None,
-        description="Optional local tif/tiff path. If omitted, a bundled sample image is used.",
+    lat: float
+    lon: float
+
+
+async def fetch_live_weather(lat: float, lon: float):
+    url = (
+        f"https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        f"&current=temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m"
     )
-
-    @field_validator("rainfall_30d")
-    @classmethod
-    def validate_rainfall(cls, v: List[float]) -> List[float]:
-        if len(v) != 30:
-            raise ValueError("rainfall_30d must contain exactly 30 values")
-        arr = np.asarray(v, dtype=np.float32)
-        if not np.isfinite(arr).all():
-            raise ValueError("rainfall_30d contains invalid numbers")
-        return [float(x) for x in arr]
-
-    @field_validator("windspeed_30d")
-    @classmethod
-    def validate_windspeed(cls, v: List[float]) -> List[float]:
-        if len(v) != 30:
-            raise ValueError("windspeed_30d must contain exactly 30 values")
-        arr = np.asarray(v, dtype=np.float32)
-        if not np.isfinite(arr).all():
-            raise ValueError("windspeed_30d contains invalid numbers")
-        return [float(x) for x in arr]
-
-
-class PredictResponse(BaseModel):
-    district: str
-    risk_score: float
-    confidence: float
-    alerts: Dict[str, str]
-    result_id: str
-
-
-def _model_assets_ready() -> bool:
-    return INFERENCE_SCRIPT.exists() and CONFIG_PATH.exists() and CHECKPOINT_PATH.exists()
-
-
-def _weather_score(rainfall_30d: List[float], windspeed_30d: List[float]) -> float:
-    rain = np.asarray(rainfall_30d, dtype=np.float32)
-    wind = np.asarray(windspeed_30d, dtype=np.float32)
-
-    rain_mean = float(rain.mean())
-    wind_mean = float(wind.mean())
-    rain_vol = float(rain.std())
-
-    rain_norm = np.clip(rain_mean / 120.0, 0.0, 1.0)
-    wind_norm = np.clip(wind_mean / 40.0, 0.0, 1.0)
-    vol_norm = np.clip(rain_vol / 60.0, 0.0, 1.0)
-
-    score = 0.55 * rain_norm + 0.35 * wind_norm + 0.10 * vol_norm
-    return float(np.clip(score, 0.0, 1.0))
-
-
-def _compute_flood_ratio(pred_tiff: Path) -> float:
-    with rasterio.open(pred_tiff) as src:
-        mask = src.read(1)
-
-    flooded = mask > 127
-    return float(flooded.sum() / max(mask.size, 1))
-
-
-def _run_prithvi(data_file: Path, run_dir: Path) -> Dict[str, Any]:
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        sys.executable,
-        str(INFERENCE_SCRIPT),
-        "--data_file",
-        str(data_file),
-        "--config",
-        str(CONFIG_PATH),
-        "--checkpoint",
-        str(CHECKPOINT_PATH),
-        "--output_dir",
-        str(run_dir),
-        "--rgb_outputs",
-    ]
-
-    env = os.environ.copy()
-    env.setdefault("HF_HUB_OFFLINE", "1")
-    env.setdefault("HF_HUB_DISABLE_XET", "1")
-
-    proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=1800)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr[-4000:])
-
-    pred_tiff = run_dir / f"pred_{data_file.stem}.tiff"
-    if not pred_tiff.exists():
-        raise RuntimeError(f"Prediction output not found: {pred_tiff}")
-
-    flood_ratio = _compute_flood_ratio(pred_tiff)
-    return {
-        "flood_ratio": flood_ratio,
-        "pred_tiff": str(pred_tiff),
-        "overlay_tiff": str(run_dir / f"rgb_pred_{data_file.stem}.tiff"),
-    }
-
-
-def _build_alerts(district: str, risk_score: float) -> Dict[str, str]:
-    if risk_score >= 0.75:
-        english = (
-            f"Critical flood risk in {district}. Move to safer ground and follow district emergency updates immediately."
-        )
-        tamil = (
-            f"{district} பகுதியில் கடும் வெள்ள ஆபத்து. பாதுகாப்பான இடத்துக்கு உடனே செல்லவும்; மாவட்ட அவசர அறிவிப்புகளைப் பின்பற்றவும்."
-        )
-    elif risk_score >= 0.5:
-        english = (
-            f"High flood warning for {district}. Keep emergency kit ready and avoid low-lying roads."
-        )
-        tamil = (
-            f"{district} பகுதியில் அதிக வெள்ள எச்சரிக்கை. அவசரப் பொருட்களைத் தயார் வைத்துக் கொள்ளவும்; தாழ்வான சாலைகளைத் தவிர்க்கவும்."
-        )
-    elif risk_score >= 0.2:
-        english = (
-            f"Moderate flood watch in {district}. Monitor weather updates and prepare local drainage measures."
-        )
-        tamil = (
-            f"{district} பகுதியில் மிதமான வெள்ள கண்காணிப்பு. வானிலை புதுப்பிப்புகளை கவனித்து, உள்ளூர் வடிகால் முன்னெச்சரிக்கை எடுக்கவும்."
-        )
-    else:
-        english = f"Low immediate flood risk in {district}. Continue regular monitoring."
-        tamil = f"{district} பகுதியில் உடனடி வெள்ள ஆபத்து குறைவு. வழக்கமான கண்காணிப்பைத் தொடர்ந்து செய்யவும்."
-
-    return {"english": english, "tamil": tamil}
-
-
-def _fuse_scores(sat_score: float, weather_score: float) -> float:
-    return float(np.clip(0.65 * sat_score + 0.35 * weather_score, 0.0, 1.0))
-
-
-def _confidence(sat_score: float, weather_score: float, used_model: bool) -> float:
-    agreement = 1.0 - abs(sat_score - weather_score)
-    base = 0.68 if used_model else 0.54
-    conf = base + 0.30 * np.clip(agreement, 0.0, 1.0)
-    return float(np.clip(conf, 0.0, 0.99))
-
-
-@app.get("/health")
-def health() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "model_assets_ready": _model_assets_ready(),
-        "inference_script": str(INFERENCE_SCRIPT),
-        "checkpoint": str(CHECKPOINT_PATH),
-    }
-
-
-@app.post("/predict", response_model=PredictResponse)
-def predict(payload: PredictRequest) -> PredictResponse:
-    result_id = str(uuid.uuid4())
-    started_at = time.time()
-    run_dir = OUTPUT_ROOT / result_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    weather_score = _weather_score(payload.rainfall_30d, payload.windspeed_30d)
-    sat_score = 0.0
-    model_status = "fallback_weather_only"
-    artifacts: Dict[str, Any] = {}
-
-    if _model_assets_ready():
-        data_file = Path(payload.satellite_path) if payload.satellite_path else DEFAULT_DATA_FILE
-        if not data_file.exists():
-            raise HTTPException(status_code=400, detail=f"Satellite file not found: {data_file}")
-
+    async with httpx.AsyncClient() as client:
         try:
-            sat_output = _run_prithvi(data_file=data_file, run_dir=run_dir)
-            sat_score = float(sat_output["flood_ratio"])
-            artifacts = sat_output
-            model_status = "prithvi_success"
-        except Exception as exc:
-            model_status = f"prithvi_failed: {str(exc)[:180]}"
+            r = await client.get(url, timeout=5)
+            if r.status_code == 200:
+                cur = r.json().get("current", {})
+                return {
+                    "temp":         f"{cur.get('temperature_2m', 0)}°C",
+                    "humidity":     f"{cur.get('relative_humidity_2m', 0)}%",
+                    "rainfall":     f"{cur.get('precipitation', 0)} mm",
+                    "windSpeed":    f"{cur.get('wind_speed_10m', 0)} km/h",
+                    "raw_rainfall": float(cur.get("precipitation", 0)),
+                }
+        except Exception as e:
+            print(f"Weather API error: {e}")
+    return {"temp": "28°C", "humidity": "85%", "rainfall": "0 mm",
+            "windSpeed": "18 km/h", "raw_rainfall": 0.0}
 
-    risk_score = _fuse_scores(sat_score=sat_score, weather_score=weather_score)
-    confidence = _confidence(sat_score=sat_score, weather_score=weather_score, used_model=model_status == "prithvi_success")
-    alerts = _build_alerts(payload.district_name, risk_score)
 
-    RESULTS_DB[result_id] = {
-        "district": payload.district_name,
-        "risk_score": risk_score,
-        "confidence": confidence,
-        "alerts": alerts,
-        "model_status": model_status,
-        "satellite_score": sat_score,
-        "weather_score": weather_score,
-        "artifacts": artifacts,
-        "latency_sec": time.time() - started_at,
-        "timestamp_unix": int(time.time()),
+def compute_risk(raw_rainfall: float, avg_flood_pct: float) -> dict:
+    """
+    Simple weighted fusion:
+      - Weather contributes up to 50 points (20mm = max)
+      - Satellite flood % contributes up to 50 points
+    """
+    weather_score   = min(50, int(raw_rainfall * 2.5))
+    satellite_score = min(50, int(avg_flood_pct * 5))
+    score = weather_score + satellite_score
+
+    if score >= 75:
+        level = "CRITICAL"
+        alerts = {
+            "en": "CRITICAL: Immediate evacuation required in low-lying coastal areas.",
+            "ta": "முக்கியமான: தாழ்வான கடலோர பகுதிகளில் உடனடியாக வெளியேற்றம் தேவை.",
+            "te": "క్రిటికల్: తక్కువ ఎత్తైన తీర ప్రాంతాల్లో వెంటనే తరలింపు అవసరం.",
+        }
+    elif score >= 50:
+        level = "HIGH"
+        alerts = {
+            "en": "HIGH RISK: Severe flooding expected. Move to higher ground immediately.",
+            "ta": "அதிக ஆபத்து: கடுமையான வெள்ளம் எதிர்பார்க்கப்படுகிறது. உயரமான இடத்திற்கு செல்லுங்கள்.",
+            "te": "అధిక ప్రమాదం: తీవ్రమైన వరద నీరు వస్తుందని అంచనా. ఎత్తైన ప్రదేశానికి వెళ్ళండి.",
+        }
+    elif score >= 25:
+        level = "MODERATE"
+        alerts = {
+            "en": "MODERATE: Flood watch in effect. Stay vigilant.",
+            "ta": "மிதமான: வெள்ள கண்காணிப்பு அமலில் உள்ளது. விழிப்புடன் இருங்கள்.",
+            "te": "మధ్యస్థంగా: వరద హెచ్చరిక అమలులో ఉంది. జాగ్రత్తగా ఉండండి.",
+        }
+    else:
+        level = "LOW"
+        alerts = {
+            "en": "LOW RISK: No immediate threat. Normal conditions.",
+            "ta": "குறைந்த ஆபத்து: உடனடி அச்சுறுத்தல் இல்லை. சாதாரண நிலைமைகள்.",
+            "te": "తక్కువ ప్రమాదం: తక్షణ ముప్పు లేదు. సాధారణ పరిస్థితులు.",
+        }
+
+    return {"score": score, "level": level, "alerts": alerts}
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "Advaya Risk Engine alive"}
+
+
+@app.get("/api/sentinel/status")
+def sentinel_status():
+    """Check which Sentinel NDWI overlays have been cached."""
+    cached = [p.stem for p in SENTINEL_DIR.glob("*.png")]
+    return {"cached_regions": cached, "available_regions": list(BBOXES.keys())}
+
+
+@app.post("/api/sentinel/overlay/{region}")
+async def get_sentinel_overlay(region: str, background_tasks: BackgroundTasks):
+    """
+    Fetch (or return cached) Sentinel-2 NDWI water overlay PNG for a named region.
+    First call triggers the Sentinel Hub API (~5-10s). Subsequent calls return instantly.
+    """
+    if region not in BBOXES:
+        return {"error": f"Unknown region. Choose from: {list(BBOXES.keys())}"}
+
+    cache_path = SENTINEL_DIR / f"{region}.png"
+
+    if cache_path.exists():
+        return {
+            "status": "cached",
+            "url":    f"/static/sentinel/{region}.png",
+            "region": region,
+            "bbox":   BBOXES[region],
+        }
+
+    # Fetch from Sentinel Hub
+    png_bytes = await fetch_ndwi_overlay(BBOXES[region])
+    if png_bytes is None:
+        return {"status": "error", "message": "Sentinel Hub API call failed. Check API key or try again."}
+
+    cache_path.write_bytes(png_bytes)
+    return {
+        "status": "fresh",
+        "url":    f"/static/sentinel/{region}.png",
+        "region": region,
+        "bbox":   BBOXES[region],
     }
 
-    return PredictResponse(
-        district=payload.district_name,
-        risk_score=round(risk_score, 4),
-        confidence=round(confidence, 4),
-        alerts=alerts,
-        result_id=result_id,
-    )
+
+@app.get("/api/overlays")
+def get_overlays():
+    """Returns the full manifest so the map can load all 67 pre-computed overlays."""
+    if not MANIFEST_PATH.exists():
+        return {"overlays": []}
+    with open(MANIFEST_PATH) as f:
+        return {"overlays": json.load(f)}
 
 
-@app.get("/results/{result_id}")
-def get_result(result_id: str) -> Dict[str, Any]:
-    result = RESULTS_DB.get(result_id)
-    if not result:
-        raise HTTPException(status_code=404, detail="Result not found")
-    return result
+@app.post("/api/predict")
+async def predict(req: PredictRequest):
+    """
+    1. Fetch real-time weather for clicked coordinates.
+    2. Use the nearest pre-computed satellite overlay to get flood %.
+    3. Fuse both into a composite risk score.
+    """
+    weather = await fetch_live_weather(req.lat, req.lon)
+
+    # Find nearest overlay to the clicked point using simple Euclidean distance
+    nearest = None
+    min_dist = float("inf")
+    if MANIFEST_PATH.exists():
+        with open(MANIFEST_PATH) as f:
+            overlays = json.load(f)
+        for o in overlays:
+            # bounds = [[south, west], [north, east]]
+            center_lat = (o["bounds"][0][0] + o["bounds"][1][0]) / 2
+            center_lon = (o["bounds"][0][1] + o["bounds"][1][1]) / 2
+            dist = ((center_lat - req.lat) ** 2 + (center_lon - req.lon) ** 2) ** 0.5
+            if dist < min_dist:
+                min_dist = dist
+                nearest = o
+
+    avg_flood_pct = nearest["flood_pct"] if nearest else 0.0
+    risk = compute_risk(weather["raw_rainfall"], avg_flood_pct)
+
+    return {
+        "status":          "success",
+        "composite_score": risk["score"],
+        "risk_level":      risk["level"],
+        "weather":         weather,
+        "alerts":          risk["alerts"],
+        "nearest_overlay": nearest,
+    }
+
+
+@app.post("/api/predict_live")
+async def predict_live(req: PredictRequest):
+    """
+    Runs actual Prithvi-EO-2.0 model on the nearest Sen1Floods11 test tile.
+    Takes ~28s on CPU. Returns real flood prediction PNG + F1/IoU metrics.
+    """
+    test_ids  = load_test_ids()
+    tile_info = find_nearest_tile(req.lat, req.lon, test_ids)
+    if tile_info is None:
+        return {"status": "error", "message": "No test tiles found."}
+
+    try:
+        result = await asyncio.to_thread(
+            run_prithvi_inference,
+            tile_info["image_id"],
+            tile_info,
+        )
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+    weather = await fetch_live_weather(req.lat, req.lon)
+    risk    = compute_risk(weather["raw_rainfall"], result["flood_pct"])
+
+    return {
+        "status":          "success",
+        "composite_score": risk["score"],
+        "risk_level":      risk["level"],
+        "weather":         weather,
+        "alerts":          risk["alerts"],
+        "prediction":      result,
+    }
