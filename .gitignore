@@ -1,0 +1,44 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+*.egg-info/
+dist/
+build/
+
+# Large model files
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# Large data files
+*.zip
+archive.zip
+dataset/
+
+# Output tiff files (large)
+*.tiff
+*.tif
+
+# Keep CSVs and graphs (small, useful)
+!test/outputs_full_eval/full_results.csv
+!test/outputs_batch_test/batch_results.csv
+
+# Logs and caches
+*.log
+.cache/
+lightning_logs/
+outputs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,7 @@
+huggingface_hub>=0.22.0
+requests>=2.31.0
+# Optional for full inference script execution:
+# terratorch
+# rasterio
+# numpy
+# torch
