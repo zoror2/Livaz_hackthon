@@ -38,6 +38,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 class PredictRequest(BaseModel):
     lat: float
     lon: float
+    monsoon: bool = False  # Simulate monsoon conditions for demo
 
 
 async def fetch_live_weather(lat: float, lon: float):
@@ -338,6 +339,18 @@ async def predict_live(req: PredictRequest):
         nearby_shelters = []
         return {"status": "error", "message": str(e)}
 
+    # Override weather with historical Cyclone Michaung data if monsoon mode
+    if req.monsoon:
+        weather = {
+            "temp":         "24°C",
+            "humidity":     "96%",
+            "rainfall":     "45 mm",
+            "windSpeed":    "75 km/h",
+            "raw_rainfall": 45.0,
+            "forecast_12h": 200.0,
+            "peak_hourly":  55.0,
+        }
+
     # --- Elevation risk: 0-25 pts ---
     if elevation is not None:
         elev_score = max(0, int(25 * (1 - min(elevation, 300) / 300)))
@@ -363,7 +376,7 @@ async def predict_live(req: PredictRequest):
     call_status = None
     sms_status  = None
     shelters    = nearby_shelters or []
-    if score >= 75:
+    if score >= 65:
         call_status = trigger_emergency_call(
             lat=req.lat, lon=req.lon, score=score,
             risk_level=risk["level"],
@@ -373,7 +386,7 @@ async def predict_live(req: PredictRequest):
         )
         # Send SMS with nearest shelter locations
         if shelters:
-            sms_body   = format_shelter_sms(score, shelters, forecast_12h)
+            sms_body   = format_shelter_sms(score, shelters, forecast_12h, lat=req.lat, lon=req.lon)
             sms_status = send_shelter_sms(sms_body)
 
     return {

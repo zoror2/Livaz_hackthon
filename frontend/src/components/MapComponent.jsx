@@ -35,7 +35,7 @@ function ClickHandler({ onMapClick }) {
   return null;
 }
 
-export default function MapComponent({ onPrediction }) {
+export default function MapComponent({ onPrediction, monsoon = false }) {
   const [overlays, setOverlays]       = useState([]);   // pre-computed Prithvi overlays
   const [sentinel, setSentinel]       = useState([]);   // real Sentinel-2 NDWI overlays
   const [clickedPin, setClickedPin]   = useState(null);
@@ -79,7 +79,7 @@ export default function MapComponent({ onPrediction }) {
       const res = await fetch(`${API}/api/predict_live`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ lat: latlng.lat, lon: latlng.lng }),
+        body:    JSON.stringify({ lat: latlng.lat, lon: latlng.lng, monsoon }),
       });
       const data = await res.json();
 
@@ -143,7 +143,7 @@ export default function MapComponent({ onPrediction }) {
 
       <MapContainer
         center={[13.0827, 80.2707]}
-        zoom={3}
+        zoom={6}
         style={{ height: '100%', width: '100%' }}
       >
         <LayersControl position="topright">

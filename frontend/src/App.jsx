@@ -5,11 +5,13 @@ import './index.css';
 
 export default function App() {
   const [lang, setLang] = useState('en');
+  const [monsoon, setMonsoon] = useState(false);
 
   const [weatherData, setWeatherData] = useState({
     rainfall: '-- mm',
     windSpeed: '-- km/h',
     humidity: '--%',
+    forecast12h: '--',
   });
 
   const [riskData, setRiskData] = useState({
@@ -107,6 +109,64 @@ export default function App() {
               Advaya Risk Engine
             </span>
           </h3>
+          {/* Monsoon Simulation Toggle */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '0.75rem 1rem',
+              borderRadius: 12,
+              marginBottom: '1rem',
+              background: monsoon
+                ? 'linear-gradient(135deg, #dc2626 0%, #ea580c 100%)'
+                : '#f1f5f9',
+              transition: 'all 0.3s ease',
+              cursor: 'pointer',
+            }}
+            onClick={() => setMonsoon(!monsoon)}
+          >
+            <div>
+              <div style={{
+                fontSize: '0.78rem',
+                fontWeight: 700,
+                color: monsoon ? '#fff' : '#475569',
+              }}>
+                🌧️ Monsoon Simulation
+              </div>
+              <div style={{
+                fontSize: '0.65rem',
+                color: monsoon ? '#fecaca' : '#94a3b8',
+                marginTop: 2,
+              }}>
+                {monsoon ? 'Cyclone Michaung (2023) active' : 'Click to simulate heavy rainfall'}
+              </div>
+            </div>
+            <div
+              style={{
+                width: 44,
+                height: 24,
+                borderRadius: 12,
+                background: monsoon ? '#fff' : '#cbd5e1',
+                position: 'relative',
+                transition: 'background 0.3s',
+              }}
+            >
+              <div
+                style={{
+                  width: 18,
+                  height: 18,
+                  borderRadius: '50%',
+                  background: monsoon ? '#dc2626' : '#fff',
+                  position: 'absolute',
+                  top: 3,
+                  left: monsoon ? 23 : 3,
+                  transition: 'all 0.3s',
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
+                }}
+              />
+            </div>
+          </div>
 
           {/* Score Card */}
           <div
@@ -173,7 +233,7 @@ export default function App() {
 
       {/* CENTRE — Interactive Map */}
       <main className="map-container">
-        <MapComponent onPrediction={handlePrediction} />
+        <MapComponent onPrediction={handlePrediction} monsoon={monsoon} />
       </main>
 
       {/* RIGHT — History */}
