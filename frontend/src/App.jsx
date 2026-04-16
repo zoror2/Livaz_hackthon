@@ -38,6 +38,7 @@ export default function App() {
   };
 
   const [tileData, setTileData] = useState(null);
+  const [shelters, setShelters] = useState([]);
 
   const handlePrediction = (data) => {
     if (data.status !== 'success') return;
@@ -54,6 +55,7 @@ export default function App() {
     });
     if (data.nearest_overlay) setTileData(data.nearest_overlay);
     if (data.prediction)      setTileData(data.prediction);
+    setShelters(data.shelters || []);
   };
 
   const riskColor = getRiskColor(riskData.level);
@@ -233,7 +235,7 @@ export default function App() {
 
       {/* CENTRE — Interactive Map */}
       <main className="map-container">
-        <MapComponent onPrediction={handlePrediction} monsoon={monsoon} />
+        <MapComponent onPrediction={handlePrediction} monsoon={monsoon} shelters={shelters} />
       </main>
 
       {/* RIGHT — History */}

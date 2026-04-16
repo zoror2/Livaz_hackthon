@@ -330,7 +330,7 @@ async def predict_live(req: PredictRequest):
         )
         weather_future  = fetch_live_weather(req.lat, req.lon)
         elev_future     = get_elevation(req.lat, req.lon)
-        shelter_future  = find_nearby_shelters(req.lat, req.lon, radius_m=5000, limit=3)
+        shelter_future  = find_nearby_shelters(req.lat, req.lon, radius_m=15000, limit=3)
 
         result, weather, elevation, nearby_shelters = await asyncio.gather(
             inference_future, weather_future, elev_future, shelter_future,
@@ -376,7 +376,7 @@ async def predict_live(req: PredictRequest):
     call_status = None
     sms_status  = None
     shelters    = nearby_shelters or []
-    if score >= 65:
+    if score >= 40:
         call_status = trigger_emergency_call(
             lat=req.lat, lon=req.lon, score=score,
             risk_level=risk["level"],

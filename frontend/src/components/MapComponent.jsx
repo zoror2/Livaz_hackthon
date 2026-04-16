@@ -35,7 +35,7 @@ function ClickHandler({ onMapClick }) {
   return null;
 }
 
-export default function MapComponent({ onPrediction, monsoon = false }) {
+export default function MapComponent({ onPrediction, monsoon = false, shelters = [] }) {
   const [overlays, setOverlays]       = useState([]);   // pre-computed Prithvi overlays
   const [sentinel, setSentinel]       = useState([]);   // real Sentinel-2 NDWI overlays
   const [clickedPin, setClickedPin]   = useState(null);
@@ -212,6 +212,47 @@ export default function MapComponent({ onPrediction, monsoon = false }) {
             </Popup>
           </Marker>
         )}
+        {/* Shelter markers — green pins for nearest safe locations */}
+        {shelters.map((s, i) => (
+          <Marker
+            key={`shelter-${i}`}
+            position={[s.lat, s.lon]}
+            icon={L.divIcon({
+              className: '',
+              html: `<div style="
+                background: #22c55e;
+                color: white;
+                width: 28px; height: 28px;
+                border-radius: 50%;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 14px;
+                font-weight: bold;
+                border: 2px solid white;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+              ">${i + 1}</div>`,
+              iconSize: [28, 28],
+              iconAnchor: [14, 14],
+            })}
+          >
+            <Popup>
+              <div style={{ minWidth: 180 }}>
+                <strong style={{ color: '#22c55e' }}>{s.type}</strong><br />
+                <strong>{s.name}</strong><br />
+                <span style={{ color: '#64748b', fontSize: '0.8rem' }}>
+                  {s.distance_km} km away
+                </span><br />
+                <a
+                  href={s.maps_link}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ color: '#2563eb', fontSize: '0.8rem', fontWeight: 600 }}
+                >
+                  Open in Google Maps →
+                </a>
+              </div>
+            </Popup>
+          </Marker>
+        ))}
       </MapContainer>
     </div>
   );
