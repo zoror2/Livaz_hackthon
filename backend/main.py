@@ -376,7 +376,7 @@ async def predict_live(req: PredictRequest):
     call_status = None
     sms_status  = None
     shelters    = nearby_shelters or []
-    if score >= 40:
+    if score >= 65:
         call_status = trigger_emergency_call(
             lat=req.lat, lon=req.lon, score=score,
             risk_level=risk["level"],
@@ -384,10 +384,9 @@ async def predict_live(req: PredictRequest):
             flood_pct=result["flood_pct"],
             forecast_48h=forecast_12h,
         )
-        # Send SMS with nearest shelter locations
-        if shelters:
-            sms_body   = format_shelter_sms(score, shelters, forecast_12h, lat=req.lat, lon=req.lon)
-            sms_status = send_shelter_sms(sms_body)
+        # Send WhatsApp with nearest shelter locations
+        sms_body   = format_shelter_sms(score, shelters, forecast_12h, lat=req.lat, lon=req.lon)
+        sms_status = send_shelter_sms(sms_body)
 
     return {
         "status":          "success",
