@@ -1,4 +1,4 @@
-# 🌊 Advaya Climate Risk Engine
+# 🌊 Climate Risk Engine
 
 **AI-Powered Predictive Flood Early Warning System**
 
